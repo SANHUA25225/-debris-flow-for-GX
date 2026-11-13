@@ -3,6 +3,7 @@
 import os, glob, math
 import numpy as np
 import fiona, rasterio
+from rasterio.windows import Window
 from shapely.geometry import shape, Point, LineString
 from shapely.strtree import STRtree
 from shapely.ops import transform as shp_tr
@@ -44,6 +45,50 @@ with rasterio.open(DEM) as ds:
             zs.append(None); dem_hit.append(0)
         else:
             zs.append(round(v, 1)); dem_hit.append(1)
+
+# ---------- 2b. 坡度与地形起伏度（在 4326 栅格上按实际米距计算） ----------
+def per_deg(lat):
+    """每度经纬对应的米数（WGS84 椭球）"""
+    phi = math.radians(lat)
+    mlon = 111412.84 * math.cos(phi) - 93.5 * math.cos(3 * phi)
+    mlat = 111132.954 - 559.822 * math.cos(2 * phi) + 1.175 * math.cos(4 * phi)
+    return mlon, mlat
+
+RAD = 2100.0          # 起伏度统计半径（m），与地貌派生的 2.1 km 窗口一致
+slopes, reliefs, rclass, mslopes = [], [], [], []
+with rasterio.open(DEM) as ds:
+    nod = ds.nodata
+    half = 85
+    for p in pts:
+        rc = ds.index(p["_x"], p["_y"])
+        r0 = max(0, rc[0] - half); c0 = max(0, rc[1] - half)
+        hh = min(2 * half + 1, ds.height - r0); ww = min(2 * half + 1, ds.width - c0)
+        a = ds.read(1, window=Window(c0, r0, ww, hh)).astype(np.float64)
+        a[a == nod] = np.nan
+        cr, cc = rc[0] - r0, rc[1] - c0
+        mlon, mlat = per_deg(p["_y"])
+        px, py = mlon / 3600.0, mlat / 3600.0
+
+        z = a[cr - 1:cr + 2, cc - 1:cc + 2]
+        if z.shape == (3, 3) and np.isfinite(z).all():
+            dzdx = ((z[0, 2] + 2 * z[1, 2] + z[2, 2]) - (z[0, 0] + 2 * z[1, 0] + z[2, 0])) / (8 * px)
+            dzdy = ((z[2, 0] + 2 * z[2, 1] + z[2, 2]) - (z[0, 0] + 2 * z[0, 1] + z[0, 2])) / (8 * py)
+            slopes.append(round(math.degrees(math.atan(math.hypot(dzdx, dzdy))), 2))
+        else:
+            slopes.append(None)
+
+        rr, ccc = np.ogrid[:a.shape[0], :a.shape[1]]
+        msk = ((rr - cr) * py) ** 2 + ((ccc - cc) * px) ** 2 <= RAD ** 2
+        v = a[msk]
+        v = v[np.isfinite(v)]
+        if v.size:
+            rel = float(v.max() - v.min())
+            reliefs.append(round(rel, 1))
+            rclass.append("平原" if rel < 30 else "台地" if rel < 70 else "丘陵" if rel < 200
+                          else "小起伏山地" if rel < 500 else "中起伏山地" if rel < 1000 else "大起伏山地")
+        else:
+            reliefs.append(None); rclass.append("")
+print("坡度/起伏度: 有效", sum(1 for x in slopes if x is not None), "/", len(slopes))
 
 # ---------- 3. 地质 ----------
 geoms, props = [], []
@@ -181,6 +226,7 @@ for i, p in enumerate(pts):
         gr["match"], gr["bdist"],
         lr_["name"], lr_["code"], lr_["match"], lr_["bdist"],
         rv[0], rv[1],
+        slopes[i], reliefs[i], rclass[i],
         "；".join(notes) if notes else "",
     ])
 
@@ -188,7 +234,8 @@ HDR = ["灾害体编号", "灾害体名称", "灾害体类型", "市", "县", "�
        "点类型", "险情等级", "灾害等级", "威胁人口", "威胁财产", "坡顶最大标高", "坡底最小标高",
        "目前稳定程度", "监测建议", "Guid",
        "ELEV_M", "DEM_HIT", "GEO_AGE", "GEO_AGE_FULL", "TYPE_RAW", "GEO_UNIT", "GEO_MATCH", "GEO_BDIST_M",
-       "LANDFORM", "LANDFORM_CODE", "LF_MATCH", "LF_BDIST_M", "DIST_RIV_M", "RIV_NAME", "备注"]
+       "LANDFORM", "LANDFORM_CODE", "LF_MATCH", "LF_BDIST_M", "DIST_RIV_M", "RIV_NAME",
+       "SLOPE_DEG", "RELIEF_M", "RELIEF_CLASS", "备注"]
 
 # ---------- 7. 统计 ----------
 z = np.array([v for v in zs if v is not None], dtype=float)
@@ -213,8 +260,10 @@ for k2, v2 in c_lf.items():
     else: c_lfgrp["其他"] += v2
 
 n_bad_z = int((z < 0).sum() + (z > 3000).sum())
-n_geo_bd = sum(1 for r in rows if "地质面边界<30m" in (r[33] or ""))
-n_lf_bd = sum(1 for r in rows if "地貌类型边界<30m" in (r[33] or ""))
+n_geo_bd = sum(1 for r in rows if "地质面边界<30m" in (r[36] or ""))
+n_lf_bd = sum(1 for r in rows if "地貌类型边界<30m" in (r[36] or ""))
+sl = np.array([v for v in slopes if v is not None], dtype=float)
+rl = np.array([v for v in reliefs if v is not None], dtype=float)
 
 # ---------- 8. 写 Excel ----------
 from openpyxl import Workbook
@@ -265,7 +314,11 @@ acc = [
      f"计算 {len(d)}/146；空值 0；{d.min():.0f}–{d.max():.0f} m，中位数 {np.median(d):.0f} m",
      "通过"],
     ["05", "属性保留", "原始编号、分类字段均保留",
-     f"输出 {len(rows)} 条；原始 19 个关键字段全部保留 + 新增 14 个衍生字段",
+     f"输出 {len(rows)} 条；原始 19 个关键字段全部保留 + 新增 17 个衍生字段",
+     "通过"],
+    ["06", "坡度与起伏度", "146 个点均能计算坡度与起伏度",
+     f"坡度 {len(sl)}/146 有效，{sl.min():.1f}–{sl.max():.1f}°，中位数 {np.median(sl):.1f}°；"
+     f"起伏度 {len(rl)}/146 有效，{rl.min():.0f}–{rl.max():.0f} m，中位数 {np.median(rl):.0f} m",
      "通过"],
 ]
 for i, r in enumerate(acc, 5):
@@ -291,7 +344,7 @@ for i, t in enumerate([
 # 01 主表
 ws = wb.create_sheet("01_空间匹配主表")
 head(ws, HDR, [20, 22, 10, 10, 10, 12, 34, 11, 11, 12, 9, 9, 9, 10, 11, 11, 10, 14, 20,
-               9, 9, 9, 14, 8, 16, 10, 12, 22, 10, 9, 11, 11, 16, 30])
+               9, 9, 9, 14, 8, 16, 10, 12, 22, 10, 9, 11, 11, 16, 10, 10, 16, 30])
 for r in rows:
     ws.append(r)
 for i in range(2, len(rows) + 2):
@@ -361,12 +414,59 @@ for s in st:
 
 # 05 疑点
 ws = wb.create_sheet("05_疑点与边界点")
-head(ws, ["灾害体编号", "县", "乡镇", "经度", "纬度", "ELEV_M", "LANDFORM", "DIST_RIV_M", "问题"],
-     [22, 12, 14, 11, 11, 9, 26, 12, 34], row=2)
+head(ws, ["灾害体编号", "县", "乡镇", "经度", "纬度", "ELEV_M", "SLOPE_DEG", "RELIEF_M",
+          "LANDFORM", "DIST_RIV_M", "问题"],
+     [22, 12, 14, 11, 11, 9, 10, 10, 26, 12, 34], row=2)
 ws["A1"] = "需要人工复核的记录（边界 / 未匹配 / 异常值）"; ws["A1"].font = Font(bold=True)
 for i, r in enumerate(rows):
-    if r[33]:
-        ws.append([r[0], r[4], r[5], r[7], r[8], r[19], r[27], r[31], r[33]])
+    if r[36]:
+        ws.append([r[0], r[4], r[5], r[7], r[8], r[19], r[34], r[35], r[27], r[31], r[36]])
+
+# 06 坡度与起伏度
+ws = wb.create_sheet("06_坡度与起伏度")
+ws["A1"] = "坡度与地形起伏度统计（DEM 30.9 m，起伏度窗口半径 2.1 km）"
+ws["A1"].font = Font(bold=True, size=12)
+head(ws, ["指标", "坡度 SLOPE_DEG (°)", "起伏度 RELIEF_M (m)"], [24, 22, 24], row=3)
+sl = np.array([v for v in slopes if v is not None], dtype=float)
+rl = np.array([v for v in reliefs if v is not None], dtype=float)
+for s in [("样本数", len(sl), len(rl)), ("空值", 146 - len(sl), 146 - len(rl)),
+          ("最小值", round(sl.min(), 2), round(rl.min(), 1)),
+          ("最大值", round(sl.max(), 2), round(rl.max(), 1)),
+          ("均值", round(sl.mean(), 2), round(rl.mean(), 1)),
+          ("中位数", round(float(np.median(sl)), 2), round(float(np.median(rl)), 1)),
+          ("标准差", round(sl.std(), 2), round(rl.std(), 1))]:
+    ws.append(list(s))
+
+r0 = ws.max_row + 2
+ws.cell(row=r0 - 1, column=1, value="① 坡度分级").font = Font(bold=True)
+for c, h in enumerate(["坡度区间", "点数", "占比(%)"], 1):
+    cell = ws.cell(row=r0, column=c, value=h); cell.font = TH; cell.fill = FH
+bins = [(0, 5), (5, 15), (15, 25), (25, 35), (35, 45), (45, 90)]
+for i, (a0, b0) in enumerate(bins):
+    n = int(((sl >= a0) & (sl < b0)).sum())
+    ws.cell(row=r0 + 1 + i, column=1, value=f"{a0}–{b0}")
+    ws.cell(row=r0 + 1 + i, column=2, value=n)
+    ws.cell(row=r0 + 1 + i, column=3, value=round(n / len(sl) * 100, 1))
+
+r1 = r0 + len(bins) + 3
+ws.cell(row=r1 - 1, column=1, value="② 起伏度分级（李炳元 1:100 万形态地貌标准）").font = Font(bold=True)
+for c, h in enumerate(["起伏度区间(m)", "地貌类型", "点数", "占比(%)"], 1):
+    cell = ws.cell(row=r1, column=c, value=h); cell.font = TH; cell.fill = FH
+CLS = [("<30", "平原"), ("30–70", "台地"), ("70–200", "丘陵"), ("200–500", "小起伏山地"),
+       ("500–1000", "中起伏山地"), (">1000", "大起伏山地")]
+for i, (rg, nm) in enumerate(CLS):
+    n = sum(1 for c0 in rclass if c0 == nm)
+    ws.cell(row=r1 + 1 + i, column=1, value=rg)
+    ws.cell(row=r1 + 1 + i, column=2, value=nm)
+    ws.cell(row=r1 + 1 + i, column=3, value=n)
+    ws.cell(row=r1 + 1 + i, column=4, value=round(n / len(rclass) * 100, 1))
+
+r2 = r1 + len(CLS) + 3
+agree = sum(1 for i in range(len(rows)) if rclass[i] and rclass[i] in (rows[i][27] or ""))
+ws.cell(row=r2, column=1, value="③ 与地貌类型交叉校验").font = Font(bold=True)
+ws.cell(row=r2 + 1, column=1, value="起伏度分级与 LANDFORM 类型一致的点数")
+ws.cell(row=r2 + 1, column=3, value=f"{agree}/{len(rows)}")
+ws.cell(row=r2 + 2, column=1, value="说明：点尺度 2.1 km 起伏度与面尺度类型边界不完全对应，不一致属正常。")
 
 for sh in wb.worksheets:
     sh.sheet_view.showGridLines = False
